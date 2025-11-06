@@ -1,0 +1,611 @@
+From 57d860e3c97140588b3fb5e25574a6b4b0ea2f2c Mon Sep 17 00:00:00 2001
+From: Alizay Ahmed <alizay1206@gmail.com>
+Date: Fri, 31 Oct 2025 02:08:22 +0500
+Subject: [PATCH 1/2] Initial commit - baseline xv6
+
+---
+ Makefile         |  2 ++
+ kernel/proc.c    | 93 ++++++++++++++++++++++++++++++++++++------------
+ kernel/proc.h    |  9 +++++
+ kernel/syscall.c |  6 ++++
+ kernel/syscall.h |  3 ++
+ kernel/sysproc.c | 43 ++++++++++++++++++++++
+ kernel/trap.c    | 42 +++++++++++++++++++---
+ user/cpubound.c  | 78 ++++++++++++++++++++++++++++++++++++++++
+ user/iobound.c   | 80 +++++++++++++++++++++++++++++++++++++++++
+ user/user.h      |  3 ++
+ user/usys.pl     |  3 ++
+ 11 files changed, 334 insertions(+), 28 deletions(-)
+ create mode 100644 user/cpubound.c
+ create mode 100644 user/iobound.c
+
+diff --git a/Makefile b/Makefile
+index dde08b1..563a947 100644
+--- a/Makefile
++++ b/Makefile
+@@ -143,6 +143,8 @@ UPROGS=\
+ 	$U/_logstress\
+ 	$U/_forphan\
+ 	$U/_dorphan\
++	$U/_cpubound\
++	$U/_iobound\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22a5401..18c4acf 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -143,6 +143,16 @@ found:
+   // Set up new context to start executing at forkret,
+   // which returns to user space.
+   memset(&p->context, 0, sizeof(p->context));
++
++//-------------------------ADDITION(Initialize MLFQ fields for new process)-------------------------
++  p->priority = 0;
++  p->time_slices = 0;
++  p->wait_time = 0;
++  p->cpu_ticks = 0;
++  p->num_scheduled = 0;
++  p->queue_entry_time = ticks;
++  //-------------------------END ADDITION-------------------------
++
+   p->context.ra = (uint64)forkret;
+   p->context.sp = p->kstack + PGSIZE;
+ 
+@@ -302,6 +312,15 @@ kfork(void)
+   np->state = RUNNABLE;
+   release(&np->lock);
+ 
++//-------------------------ADDITION(Initialize child MLFQ fields)-------------------------
++  np->priority = 0;
++  np->time_slices = 0;
++  np->wait_time = 0;
++  np->cpu_ticks = 0;
++  np->num_scheduled = 0;
++  np->queue_entry_time = ticks;
++  //-------------------------END ADDITION-------------------------
++
+   return pid;
+ }
+ 
+@@ -421,47 +440,75 @@ kwait(uint64 addr)
+ //  - swtch to start running that process.
+ //  - eventually that process transfers control
+ //    via swtch back to the scheduler.
++
+ void
+ scheduler(void)
+ {
+   struct proc *p;
+   struct cpu *c = mycpu();
+-
++  
+   c->proc = 0;
+   for(;;){
+-    // The most recent process to run may have had interrupts
+-    // turned off; enable them to avoid a deadlock if all
+-    // processes are waiting. Then turn them back off
+-    // to avoid a possible race between an interrupt
+-    // and wfi.
+     intr_on();
+-    intr_off();
+-
+-    int found = 0;
++    
++    //-------------------------ADDITION(Aging mechanism to prevent starvation)-------------------------
+     for(p = proc; p < &proc[NPROC]; p++) {
+       acquire(&p->lock);
+       if(p->state == RUNNABLE) {
+-        // Switch to chosen process.  It is the process's job
+-        // to release its lock and then reacquire it
+-        // before jumping back to us.
+-        p->state = RUNNING;
+-        c->proc = p;
+-        swtch(&c->context, &p->context);
+-
+-        // Process is done running for now.
+-        // It should have changed its p->state before coming back.
+-        c->proc = 0;
+-        found = 1;
++        p->wait_time++;
++        if(p->wait_time > 30 && p->priority > 0) {
++          p->priority--;
++          p->wait_time = 0;
++          p->queue_entry_time = ticks;
++          p->time_slices = 0;
++        }
+       }
+       release(&p->lock);
+     }
+-    if(found == 0) {
+-      // nothing to run; stop running on this core until an interrupt.
+-      asm volatile("wfi");
++    //-------------------------END ADDITION-------------------------
++    
++    //-------------------------ADDITION(MLFQ priority-based process selection)-------------------------
++    struct proc *selected = 0;
++    int highest_priority = 4;
++    uint64 earliest_entry = 0;
++    
++    for(p = proc; p < &proc[NPROC]; p++) {
++      acquire(&p->lock);
++      if(p->state == RUNNABLE) {
++        if(p->priority < highest_priority || 
++           (p->priority == highest_priority && 
++            (selected == 0 || p->queue_entry_time < earliest_entry))) {
++          
++          if(selected != 0) {
++            release(&selected->lock);
++          }
++          selected = p;
++          highest_priority = p->priority;
++          earliest_entry = p->queue_entry_time;
++        } else {
++          release(&p->lock);
++        }
++      } else {
++        release(&p->lock);
++      }
++    }
++    //-------------------------END ADDITION-------------------------
++    
++    if(selected != 0) {
++      selected->state = RUNNING;
++      selected->num_scheduled++;
++      selected->wait_time = 0;
++      c->proc = selected;
++      
++      swtch(&c->context, &selected->context);
++      
++      c->proc = 0;
++      release(&selected->lock);
+     }
+   }
+ }
+ 
++
+ // Switch to scheduler.  Must hold only p->lock
+ // and have changed proc->state. Saves and restores
+ // intena because intena is a property of this
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..8fcbadf 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -104,4 +104,13 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++
++//-------------------------ADDITION(MLFQ scheduling fields)-------------------------
++  int priority;                // Current queue number (0=highest, 3=lowest)
++  int time_slices;            // Time slices used in current queue
++  int wait_time;              // Ticks spent waiting (for aging)
++  int cpu_ticks;              // Total CPU ticks consumed
++  int num_scheduled;          // Number of times scheduled
++  uint64 queue_entry_time;    // Tick when entered current queue
++  //-------------------------END ADDITION-------------------------
+ };
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 076d965..dfa27eb 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,9 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++//-------------------------ADDITION(External declaration for getprocinfo)-------------------------
++extern uint64 sys_getprocinfo(void);
++//-------------------------END ADDITION-------------------------
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +129,9 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++//-------------------------ADDITION(Register getprocinfo in syscall table)-------------------------
++[SYS_getprocinfo] sys_getprocinfo,
++//-------------------------END ADDITION-------------------------
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 3dd926d..7ab6627 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,6 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++//-------------------------ADDITION(System call number for getprocinfo)-------------------------
++#define SYS_getprocinfo 22
++//-------------------------END ADDITION-------------------------
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 419e727..e86a335 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -107,3 +107,46 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++
++//-------------------------ADDITION(getprocinfo system call implementation)-------------------------
++uint64
++sys_getprocinfo(void)
++{
++  int target_pid;
++  uint64 info_addr;
++  
++  argint(0, &target_pid);
++  argaddr(1, &info_addr);
++  
++  // Get current process and search
++  struct proc *p = myproc();
++  struct proc *target = 0;
++  
++  // Search in proc table - extern declaration
++  extern struct proc proc[NPROC];
++  
++  for(int i = 0; i < NPROC; i++) {
++    acquire(&proc[i].lock);
++    if(proc[i].pid == target_pid && proc[i].state != UNUSED) {
++      target = &proc[i];
++      
++      int data[4];
++      data[0] = target->pid;
++      data[1] = target->cpu_ticks;
++      data[2] = target->num_scheduled;
++      data[3] = target->priority;
++      
++      release(&proc[i].lock);
++      
++      if(copyout(p->pagetable, info_addr, (char *)data, sizeof(data)) < 0)
++        return -1;
++      
++      return 0;
++    }
++    release(&proc[i].lock);
++  }
++  
++  return -1;
++}
++//-------------------------END ADDITION-------------------------
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a41cd69..80120ea 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -81,9 +81,26 @@ usertrap(void)
+     kexit(-1);
+ 
+   // give up the CPU if this is a timer interrupt.
+-  if(which_dev == 2)
+-    yield();
+-
++  if(which_dev == 2) {
++    //-------------------------ADDITION(MLFQ time quantum enforcement)-------------------------
++    struct proc *p = myproc();
++    if(p != 0) {
++      p->cpu_ticks++;
++      p->time_slices++;
++      
++      int quantum = 1 << p->priority;  // 2^priority
++      
++      if(p->time_slices >= quantum) {
++        if(p->priority < 3) {
++          p->priority++;
++          p->queue_entry_time = ticks;
++        }
++        p->time_slices = 0;
++        yield();
++      }
++    }
++    //-------------------------END ADDITION-------------------------
++  }
+   prepare_return();
+ 
+   // the user page table to switch to, for trampoline.S
+@@ -152,8 +169,23 @@ kerneltrap()
+   }
+ 
+   // give up the CPU if this is a timer interrupt.
+-  if(which_dev == 2 && myproc() != 0)
+-    yield();
++  if(which_dev == 2 && myproc() != 0 && myproc()->state == RUNNING) {
++    struct proc *p = myproc();
++    p->cpu_ticks++;
++    p->time_slices++;
++  
++    int quantum = 1 << p->priority;
++  
++    if(p->time_slices >= quantum) {
++      if(p->priority < 3) {
++        p->priority++;
++        p->queue_entry_time = ticks;
++      }
++      p->time_slices = 0;
++      yield();
++      }
++    }
++
+ 
+   // the yield() may have caused some traps to occur,
+   // so restore trap registers for use by kernelvec.S's sepc instruction.
+diff --git a/user/cpubound.c b/user/cpubound.c
+new file mode 100644
+index 0000000..bb93226
+--- /dev/null
++++ b/user/cpubound.c
+@@ -0,0 +1,78 @@
++//-------------------------ADDITION(CPU-bound benchmark application)-------------------------
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int is_prime(int n) {
++  if (n <= 1) return 0;
++  if (n <= 3) return 1;
++  if (n % 2 == 0 || n % 3 == 0) return 0;
++  
++  for (int i = 5; i * i <= n; i += 6) {
++    if (n % i == 0 || n % (i + 2) == 0)
++      return 0;
++  }
++  return 1;
++}
++
++int main(int argc, char *argv[]) {
++  printf("========================================\n");
++  printf("CPU-Bound Application Started\n");
++  printf("PID: %d\n", getpid());
++  printf("========================================\n");
++  
++  int count = 0;
++  int limit = 5000;  // Reduced limit but MORE iterations
++  
++  uint start = uptime();
++  
++  printf("Calculating primes (heavy workload)...\n");
++  
++  // Do MANY passes to consume more CPU time
++  for(int pass = 0; pass < 50; pass++) {  // 50 passes!
++    for (int i = 2; i < limit; i++) {
++      if (is_prime(i)) {
++        count++;
++      }
++    }
++    
++    // Print progress every 10 passes
++    if((pass + 1) % 10 == 0) {
++      printf("  Pass %d/50 complete...\n", pass + 1);
++    }
++  }
++  
++  count = count / 50;  // Average count
++  
++  uint end = uptime();
++  
++  printf("\n");
++  printf("========================================\n");
++  printf("CPU-Bound Application Results\n");
++  printf("========================================\n");
++  printf("Primes found (per pass): %d\n", count);
++  printf("Range: 2 to %d\n", limit);
++  printf("Total passes: 50\n");
++  printf("Execution time: %d ticks\n", end - start);
++  printf("\n");
++  
++  int info[4];
++  
++  if (getprocinfo(getpid(), info) == 0) {
++    printf("Process Performance Metrics:\n");
++    printf("  Process ID: %d\n", info[0]);
++    printf("  CPU Ticks Consumed: %d\n", info[1]);
++    printf("  Times Scheduled: %d\n", info[2]);
++    printf("  Final Priority Queue: %d (0=highest, 3=lowest)\n", info[3]);
++    
++    if (info[2] > 0) {
++      printf("  Average CPU burst: %d ticks\n", info[1] / info[2]);
++    }
++  } else {
++    printf("Failed to get process info\n");
++  }
++  
++  printf("========================================\n");
++  
++  exit(0);
++}
+diff --git a/user/iobound.c b/user/iobound.c
+new file mode 100644
+index 0000000..d6fa70a
+--- /dev/null
++++ b/user/iobound.c
+@@ -0,0 +1,80 @@
++//-------------------------ADDITION(I/O-bound benchmark application)-------------------------
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "kernel/fcntl.h"
++#include "user/user.h"
++
++int main(int argc, char *argv[]) {
++  printf("========================================\n");
++  printf("I/O-Bound Application Started\n");
++  printf("PID: %d\n", getpid());
++  printf("========================================\n");
++  
++  int fd;
++  int iterations = 200;
++  int writes_per_iteration = 20;
++  
++  uint start = uptime();
++  
++  printf("Performing %d I/O iterations...\n", iterations);
++  
++  for (int i = 0; i < iterations; i++) {
++    fd = open("iotest.txt", O_CREATE | O_WRONLY);
++    if (fd < 0) {
++      printf("I/O-Bound: Failed to open file\n");
++      exit(1);
++    }
++    
++    for (int j = 0; j < writes_per_iteration; j++) {
++      write(fd, "IO", 2);
++    }
++    
++    close(fd);
++    // Simulate I/O wait with a small delay
++    for(int k = 0; k < 1000; k++) {
++      // Small busy wait
++    }
++    
++    if ((i + 1) % 20 == 0) {
++      printf("  Completed %d/%d iterations...\n", i + 1, iterations);
++    }
++  }
++  
++  uint end = uptime();
++  
++  printf("\n");
++  printf("========================================\n");
++  printf("I/O-Bound Application Results\n");
++  printf("========================================\n");
++  printf("Total iterations: %d\n", iterations);
++  printf("Writes per iteration: %d\n", writes_per_iteration);
++  printf("Total writes: %d\n", iterations * writes_per_iteration);
++  printf("Execution time: %d ticks\n", end - start);
++  printf("\n");
++  
++  int info[4];
++  
++  if (getprocinfo(getpid(), info) == 0) {
++    printf("Process Performance Metrics:\n");
++    printf("  Process ID: %d\n", info[0]);
++    printf("  CPU Ticks Consumed: %d\n", info[1]);
++    printf("  Times Scheduled: %d\n", info[2]);
++    printf("  Final Priority Queue: %d (0=highest, 3=lowest)\n", info[3]);
++    
++    if (info[2] > 0) {
++      printf("  Average CPU burst: %d ticks\n", info[1] / info[2]);
++    }
++    
++    printf("  I/O operations: %d\n", iterations);
++    printf("  CPU/IO ratio: 1:%d\n", iterations / (info[1] > 0 ? info[1] : 1));
++  } else {
++    printf("Failed to get process info\n");
++  }
++  
++  printf("========================================\n");
++  
++  unlink("iotest.txt");
++  
++  exit(0);
++}
++//-------------------------END ADDITION-------------------------
+diff --git a/user/user.h b/user/user.h
+index ac84de9..28b8561 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -25,6 +25,9 @@ char* sys_sbrk(int,int);
+ int pause(int);
+ int uptime(void);
+ 
++//-------------------------ADDITION(User-space prototype for getprocinfo)-------------------------
++int getprocinfo(int pid, int* info);
++//-------------------------END ADDITION-------------------------
+ // ulib.c
+ int stat(const char*, struct stat*);
+ char* strcpy(char*, const char*);
+diff --git a/user/usys.pl b/user/usys.pl
+index c5d4c3a..7727abe 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -42,3 +42,6 @@ entry("getpid");
+ entry("sbrk");
+ entry("pause");
+ entry("uptime");
++#-------------------------ADDITION(Generate assembly stub for getprocinfo)-------------------------
++entry("getprocinfo");
++#-------------------------END ADDITION-------------------------
+-- 
+2.43.0
+
+
+From 2eb4ff7ece6e7d3ac1fc481c151ea328fc90ba9d Mon Sep 17 00:00:00 2001
+From: Alizay Ahmed <alizay1206@gmail.com>
+Date: Fri, 31 Oct 2025 15:58:06 +0500
+Subject: [PATCH 2/2] Add testboth program for concurrent testing
+
+---
+ Makefile        |  2 ++
+ user/testboth.c | 45 +++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 47 insertions(+)
+ create mode 100644 user/testboth.c
+
+diff --git a/Makefile b/Makefile
+index 563a947..0ad11bf 100644
+--- a/Makefile
++++ b/Makefile
+@@ -145,6 +145,8 @@ UPROGS=\
+ 	$U/_dorphan\
+ 	$U/_cpubound\
+ 	$U/_iobound\
++	$U/_testboth\
++
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/user/testboth.c b/user/testboth.c
+new file mode 100644
+index 0000000..c0a0287
+--- /dev/null
++++ b/user/testboth.c
+@@ -0,0 +1,45 @@
++#include "kernel/types.h"
++#include "user/user.h"
++
++int main(int argc, char *argv[]) {
++  int pid1, pid2;
++  
++  printf("========================================\n");
++  printf("Starting Concurrent Test\n");
++  printf("========================================\n");
++  
++  // Fork first child for cpubound
++  pid1 = fork();
++  if(pid1 == 0) {
++    // Child 1: run cpubound
++    char *args[] = {"cpubound", 0};
++    exec("cpubound", args);
++    printf("exec cpubound failed\n");
++    exit(1);
++  }
++  
++  // Fork second child for iobound
++  pid2 = fork();
++  if(pid2 == 0) {
++    // Child 2: run iobound
++    char *args[] = {"iobound", 0};
++    exec("iobound", args);
++    printf("exec iobound failed\n");
++    exit(1);
++  }
++  
++  // Parent: wait for both to complete
++  printf("Both processes started...\n");
++  printf("CPU-bound PID: %d\n", pid1);
++  printf("I/O-bound PID: %d\n", pid2);
++  printf("Waiting for completion...\n\n");
++  
++  wait(0);
++  wait(0);
++  
++  printf("\n========================================\n");
++  printf("Both processes completed!\n");
++  printf("========================================\n");
++  
++  exit(0);
++}
+-- 
+2.43.0
+
